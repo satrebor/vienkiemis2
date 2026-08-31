@@ -2319,6 +2319,14 @@ function Sandbox({ hero: initialHero, username, token, onLogout }) {
   const networkZombiesRef = useRef([]);
   const networkLootRef = useRef([]);
   const networkCampfiresRef = useRef([]);
+  // Tinklu ateinančių lauko zombių GLOTNINTA (interpoliuota) vaizdavimo pozicija, id -> {x,y} -
+  // 'world:zombies' ateina tik kas ~180ms (žr. gameServer.js TICK_MS), o kiekvienas naujas
+  // pranešimas atkeičia VISĄ networkZombiesRef.current masyvą naujais objektais (senos z.x/z.y
+  // reikšmės dingsta), tad be šito Map'o piešimas "šoktų" tarp taškų kas kadrą - žr. naudojimą
+  // frame() cikle (atnaujinama) ir zombių piešimo bloke (naudojama vietoj z.x/z.y). Tik lauko
+  // scenai - vidaus (building) zombiai jau simuliuojami kas kadrą, jiems glotninimo nereikia.
+  const zombieRenderPosRef = useRef(new Map());
+  const NET_SMOOTH_RATE = 14; // kuo didesnis, tuo greičiau vaizdas "pasiveja" tikrą tinklo poziciją
   const lastMoveEmitRef = useRef(0);
   // Kurie lauko grobio id jau siunčiami serveriui (laukiama ack'o) - apsaugo nuo to paties
   // grobio "loot:collect" spam'inimo kas kadrą, kol žaidėjas stovi ant jo.
@@ -2328,9 +2336,31 @@ function Sandbox({ hero: initialHero, username, token, onLogout }) {
     const socket = io({ auth: { token } });
     socketRef.current = socket;
     socket.on('connect_error', (err) => { console.warn('Socket prisijungimo klaida:', err.message); });
-    socket.on('players:snapshot', (list) => { otherPlayersRef.current = new Map(list.filter((p) => p.username !== username).map((p) => [p.id, p])); });
-    socket.on('player:joined', ({ player }) => { if (player.username !== username) otherPlayersRef.current.set(player.id, player); });
-    socket.on('player:moved', (player) => { otherPlayersRef.current.set(player.id, player); });
+    // Kiekvienam žaidėjui šalia serverio siunčiamų (autoritetingų) x/y saugome IR renderX/renderY -
+    // glotnintą vaizdavimo poziciją, kuri kiekvieną kadrą lėtai "pasiveja" x/y (žr. frame() ciklą
+    // žemiau) - be to kiti žaidėjai "šoktų" tarp taškų kas ~130ms (žr. player:move throttle
+    // gameServer.js/šio failo), o ne judėtų sklandžiai. Naują reikšmę gavus, SENAS renderX/renderY
+    // paliekamas (jei jau buvo) - tik x/y (tikslas) atnaujinamas; pirmą kartą pasirodžius žaidėjui,
+    // renderX/renderY nustatomas iš karto lygus x/y (be jokio "atšokimo" iš (0,0)).
+    function upsertOtherPlayer(p) {
+      const prev = otherPlayersRef.current.get(p.id);
+      otherPlayersRef.current.set(p.id, {
+        ...p,
+        renderX: prev ? prev.renderX : p.x,
+        renderY: prev ? prev.renderY : p.y,
+      });
+    }
+    socket.on('players:snapshot', (list) => {
+      const next = new Map();
+      for (const p of list) {
+        if (p.username === username) continue;
+        const prev = otherPlayersRef.current.get(p.id);
+        next.set(p.id, { ...p, renderX: prev ? prev.renderX : p.x, renderY: prev ? prev.renderY : p.y });
+      }
+      otherPlayersRef.current = next;
+    });
+    socket.on('player:joined', ({ player }) => { if (player.username !== username) upsertOtherPlayer(player); });
+    socket.on('player:moved', (player) => { upsertOtherPlayer(player); });
     socket.on('player:left', ({ id }) => { otherPlayersRef.current.delete(id); });
     socket.on('world:zombies', (list) => { networkZombiesRef.current = list; });
     socket.on('world:lootDrops', (list) => { networkLootRef.current = list; });
@@ -2615,6 +2645,30 @@ function Sandbox({ hero: initialHero, username, token, onLogout }) {
       // toliau žemiau esančiame cikle, apsaugotame scene === 'building' patikra.
       if (scene === 'world') {
         zombiesRef.current = networkZombiesRef.current;
+        // Glotniname lauko zombių IR kitų žaidėjų vaizdavimo poziciją link naujausios tinklu
+        // gautos (autoritetingos) x/y - žr. zombieRenderPosRef/upsertOtherPlayer komentarus
+        // aukščiau. Naudojame eksponentinį "lerp" (kiek liko atstumo * dt * NET_SMOOTH_RATE),
+        // tad greitis nepriklauso nuo kadrų dažnio (frame rate) - veiks vienodai sklandžiai tiek
+        // 30, tiek 144 Hz ekrane.
+        const seenZombieIds = new Set();
+        for (const z of zombiesRef.current) {
+          seenZombieIds.add(z.id);
+          let rp = zombieRenderPosRef.current.get(z.id);
+          if (!rp) { rp = { x: z.x, y: z.y }; zombieRenderPosRef.current.set(z.id, rp); }
+          else {
+            rp.x += (z.x - rp.x) * Math.min(1, dt * NET_SMOOTH_RATE);
+            rp.y += (z.y - rp.y) * Math.min(1, dt * NET_SMOOTH_RATE);
+          }
+        }
+        // pašaliname pozicijas zombių, kurių nebėra naujausiame snapshot'e (nužudyti/dingę) - kitaip
+        // Map augtų be ribų per visą sesiją.
+        for (const id of zombieRenderPosRef.current.keys()) {
+          if (!seenZombieIds.has(id)) zombieRenderPosRef.current.delete(id);
+        }
+        for (const op of otherPlayersRef.current.values()) {
+          op.renderX += (op.x - op.renderX) * Math.min(1, dt * NET_SMOOTH_RATE);
+          op.renderY += (op.y - op.renderY) * Math.min(1, dt * NET_SMOOTH_RATE);
+        }
       }
 
       // laužų/grobio gyvavimo laikas - pašaliname pasibaigusius; tai aktualu TIK vidaus
@@ -3248,9 +3302,14 @@ function Sandbox({ hero: initialHero, username, token, onLogout }) {
         items.push({ depth: l.x + l.y + 0.35, draw: () => drawLoot(stageCtx, originX + s.x, originY + s.y, l.type, ts / 1000) });
       }
       for (const z of zombiesRef.current) {
-        const s = gridToScreen(z.x, z.y);
+        // Lauko scenoje piešiame GLOTNINTĄ (zombieRenderPosRef) poziciją, ne tiesiogiai z.x/z.y -
+        // pastaroji šokinėja kas ~180ms (žr. frame() ciklo pradžią, kur šis Map'as atnaujinamas).
+        // Vidaus (building) scenoje zombieRenderPosRef nepildomas, tad tiesiog naudojame z.x/z.y
+        // (jau ir taip sklandu, nes simuliuojama kas kadrą).
+        const dz = (scene === 'world' && zombieRenderPosRef.current.get(z.id)) || z;
+        const s = gridToScreen(dz.x, dz.y);
         items.push({
-          depth: z.x + z.y + 0.5 + (z.type === 'boss' ? 0.05 : 0),
+          depth: dz.x + dz.y + 0.5 + (z.type === 'boss' ? 0.05 : 0),
           draw: () => {
             const anim = {
               moving: true, phase: z.phase, idlePhase: z.idlePhase, facing: z.facing,
@@ -3316,9 +3375,11 @@ function Sandbox({ hero: initialHero, username, token, onLogout }) {
         if (scene === 'world') {
           const animT = performance.now() / 1000;
           for (const op of otherPlayersRef.current.values()) {
-            const os = gridToScreen(op.x, op.y);
+            // renderX/renderY - glotninta pozicija (žr. frame() ciklo pradžią), NE op.x/op.y
+            // tiesiogiai - pastaroji atnaujinama tik kas ~130ms (žr. player:moved).
+            const os = gridToScreen(op.renderX, op.renderY);
             items.push({
-              depth: op.x + op.y + 0.55,
+              depth: op.renderX + op.renderY + 0.55,
               draw: () => {
                 drawHumanoid(stageCtx, originX + os.x, originY + os.y, { body: op.bodyColor || '#4a6fa5', head: '#d9ad82', accent: op.accentColor || '#e6a13c' }, {
                   moving: !!op.moving, phase: animT * 9, idlePhase: animT * 2.1,
