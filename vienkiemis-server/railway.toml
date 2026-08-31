@@ -1,0 +1,9 @@
+# Railway naudoja šį failą projekto build/deploy nustatymams. Kadangi turime Dockerfile, Railway
+# jį aptiks automatiškai net ir be šio failo - jis čia tik aiškumui bei restart politikai.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
